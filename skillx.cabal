@@ -1,0 +1,73 @@
+cabal-version:      3.0
+name:               skillx
+version:            0.1.0.0
+synopsis:           A declarative multi-harness skill graph compiler and manager
+description:
+  Skillx stores procedural agent skills and rules as a declarative graph of
+  canonical SKILL.md files, checks graph integrity and environment
+  requirements, and compiles tiered plugin trees for Claude Code, Antigravity,
+  OpenCode and Codex.
+homepage:           https://github.com/lillycham/skillx
+bug-reports:        https://github.com/lillycham/skillx/issues
+category:           AI, Development
+tested-with:        GHC == 9.10.3
+license:            MIT
+author:             Lilly Cham
+maintainer:         me@lillycham.com
+copyright:          2026 Lilly Cham
+license-file:       LICENSE
+build-type:         Simple
+extra-doc-files:    README.md
+
+common shared
+    default-language: GHC2021
+    ghc-options:      -Wall -Wprepositive-qualified-module -Wmissing-import-lists
+    default-extensions: ImportQualifiedPost
+                      , OverloadedStrings
+
+executable skillx
+    import:           shared
+    main-is:          Main.hs
+    hs-source-dirs:   app
+    build-depends:    base >= 4 && < 5
+                    , skillx
+
+library
+    import:           shared
+    hs-source-dirs:   src
+    build-depends:    aeson
+                    , base >= 4 && < 5
+                    , bytestring
+                    , containers
+                    , directory
+                    , filepath
+                    , optparse-applicative
+                    , text
+                    , toml-parser
+    exposed-modules:  Skillx.Name
+                    , Skillx.Graph
+                    , Skillx.Skill
+                    , Skillx.Manifest
+                    , Skillx.Check
+                    , Skillx.Compile
+                    , Skillx.Store
+                    , Skillx.CLI
+
+test-suite skillx-test
+    import:           shared
+    type:             exitcode-stdio-1.0
+    main-is:          Main.hs
+    hs-source-dirs:   test
+    ghc-options:      -threaded -rtsopts "-with-rtsopts=-N"
+    build-depends:    aeson
+                    , base >= 4 && < 5
+                    , bytestring
+                    , containers
+                    , directory
+                    , filepath
+                    , skillx
+                    , tasty
+                    , tasty-hunit
+                    , tasty-quickcheck
+                    , temporary
+                    , text
