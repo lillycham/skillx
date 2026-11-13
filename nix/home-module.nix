@@ -194,6 +194,30 @@ let
   enabledTargets = filterAttrs (_: t: t.enable) targetDefs;
 
   compiledTrees = mapAttrs (_: t: buildHarness t.harness) enabledTargets;
+
+  # Claude Code loads plugins from a marketplace. Wrap the compiled plugin
+  # in a marketplace that holds only this plugin, so the activation step
+  # can add it.
+  claudeMarketplaceJson = pkgs.writeText "marketplace.json" (
+    builtins.toJSON {
+      name = cfg.name;
+      owner.name = cfg.name;
+      plugins = [
+        {
+          name = cfg.name;
+          source = "./plugins/${cfg.name}";
+          description = "Compiled by skillx (${cfg.name})";
+        }
+      ];
+    }
+  );
+
+  claudeMarketplace = pkgs.runCommand "skillx-${cfg.name}-marketplace" { } ''
+    mkdir -p "$out/.claude-plugin" "$out/plugins"
+    cp -r ${compiledTrees.claudeCode} "$out/plugins/${cfg.name}"
+    chmod -R u+w "$out/plugins/${cfg.name}"
+    cp ${claudeMarketplaceJson} "$out/.claude-plugin/marketplace.json"
+  '';
 in
 {
   options.programs.skillx = {
@@ -356,5 +380,24 @@ in
         source = compiledTrees.${key};
       }
     ) enabledTargets;
+
+    # Register the Claude Code marketplace and install the plugin from it.
+    # The store path changes with each build, so re-add it on every switch.
+    # Claude Code is not a Nix package here, so look for it on PATH first.
+    home.activation.skillxClaudeMarketplace = mkIf cfg.targets.claudeCode.enable (
+      lib.hm.dag.entryAfter [ "writeBoundary" ] ''
+        claude="$(command -v claude || true)"
+        if [ -z "$claude" ] && [ -x "$HOME/.local/bin/claude" ]; then
+          claude="$HOME/.local/bin/claude"
+        fi
+        if [ -n "$claude" ]; then
+          run "$claude" plugin marketplace remove ${cfg.name} >/dev/null 2>&1 || true
+          run "$claude" plugin marketplace add ${claudeMarketplace}
+          run "$claude" plugin install ${cfg.name}@${cfg.name} --scope user -y
+        else
+          echo "skillx: claude not found, skipping plugin install for ${cfg.name}" >&2
+        fi
+      ''
+    );
   };
 }
