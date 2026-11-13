@@ -32,13 +32,16 @@ module Skillx.Compile
   )
 where
 
-import Data.Aeson (object, (.=))
+import Data.Aeson (Value, object, (.=))
 import Data.Aeson qualified as Aeson
+import Data.Aeson.Key qualified as Key
 import Data.ByteString (ByteString)
 import Data.ByteString.Lazy qualified as BL
 import Data.List (nub)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
+import Data.Maybe (fromMaybe)
+import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
 import Data.Text qualified as T
@@ -46,13 +49,47 @@ import Data.Text.Encoding (encodeUtf8)
 import Skillx.Check (Finding (findingSeverity), Severity (Problem), check)
 import Skillx.Graph qualified as Graph
 import Skillx.Manifest
-  ( Manifest (manAlways, manEntry, manName, manVersion),
+  ( HookEvent
+      ( PostInvocation,
+        PostToolUse,
+        PreInvocation,
+        PreToolUse,
+        SessionStart,
+        Stop
+      ),
+    HookSpec
+      ( hookCommand,
+        hookEvent,
+        hookInject,
+        hookMatcher,
+        hookTimeout
+      ),
+    Manifest
+      ( manAlways,
+        manEntry,
+        manHooks,
+        manMcp,
+        manName,
+        manVersion
+      ),
+    McpServer (McpHttp, McpStdio, mcpArgs, mcpCommand, mcpEnv, mcpUrl),
     Place,
     PlaceRules (PlaceRules, prAlways, prEntry),
+    hookEventText,
     matchingPlaceRules,
   )
 import Skillx.Name (Name, nameText)
-import Skillx.Skill (Skill (skillBody, skillDescription, skillLinks, skillName), skillGraph)
+import Skillx.Skill
+  ( Skill
+      ( skillBody,
+        skillDescription,
+        skillLinks,
+        skillName,
+        skillRequiresHook,
+        skillRequiresMcp
+      ),
+    skillGraph,
+  )
 
 -- | Supported target agent harnesses.
 data Harness
@@ -159,13 +196,58 @@ compile ::
 compile packages manifest harness mPlace =
   case filter ((== Problem) . findingSeverity) (check skills manifest) of
     problems@(_ : _) -> Left (map VerificationFailed problems)
-    [] -> Right (FileTree (manifestFiles <> alwaysFiles <> skillNodeFiles))
+    [] ->
+      Right
+        ( FileTree
+            ( manifestFiles
+                <> mcpFiles
+                <> hookFiles
+                <> alwaysFiles
+                <> skillNodeFiles
+            )
+        )
   where
     skills :: Map Name Skill
     skills = Map.map spSkill packages
 
     tiers :: Map Name Tier
     tiers = assignTiers skills manifest mPlace
+
+    requiredMcp :: Set Name
+    requiredMcp =
+      foldMap
+        (maybe Set.empty skillRequiresMcp . (`Map.lookup` skills))
+        (Map.keys tiers)
+
+    activeMcp :: Map Name McpServer
+    activeMcp = Map.restrictKeys (manMcp manifest) requiredMcp
+
+    requiredHooks :: Set Name
+    requiredHooks =
+      foldMap
+        (maybe Set.empty skillRequiresHook . (`Map.lookup` skills))
+        (Map.keys tiers)
+
+    activeHooks :: Map Name HookSpec
+    activeHooks = Map.restrictKeys (manHooks manifest) requiredHooks
+
+    mcpFiles :: Map FilePath ByteString
+    mcpFiles
+      | Map.null activeMcp = Map.empty
+      | otherwise = case harness of
+          ClaudeCode -> Map.singleton ".mcp.json" (mcpJsonBytes activeMcp)
+          Antigravity -> Map.singleton "mcp_config.json" (mcpJsonBytes activeMcp)
+          OpenCode -> Map.empty
+          Codex -> Map.empty
+
+    hookFiles :: Map FilePath ByteString
+    hookFiles
+      | Map.null activeHooks = Map.empty
+      | otherwise = case harness of
+          ClaudeCode -> claudeHookFiles activeHooks
+          Antigravity -> antigravityHookFiles activeHooks
+          OpenCode -> Map.empty
+          Codex -> Map.empty
 
     placeRules :: PlaceRules
     placeRules = maybe (PlaceRules [] []) (`matchingPlaceRules` manifest) mPlace
@@ -321,3 +403,149 @@ pluginJsonBytes m =
         )
     )
     <> "\n"
+
+mcpJsonBytes :: Map Name McpServer -> ByteString
+mcpJsonBytes servers =
+  BL.toStrict
+    ( Aeson.encode
+        ( object
+            [ "mcpServers"
+                .= object
+                  [ Key.fromText (nameText name) .= mcpServerValue srv
+                  | (name, srv) <- Map.toAscList servers
+                  ]
+            ]
+        )
+    )
+    <> "\n"
+  where
+    mcpServerValue :: McpServer -> Value
+    mcpServerValue = \case
+      McpStdio {mcpCommand = cmd, mcpArgs = args, mcpEnv = env} ->
+        object $
+          [ "command" .= cmd,
+            "args" .= args
+          ]
+            ++ ["env" .= env | not (Map.null env)]
+      McpHttp {mcpUrl = url} ->
+        object ["url" .= url]
+
+antigravityHookFiles :: Map Name HookSpec -> Map FilePath ByteString
+antigravityHookFiles hooks =
+  Map.insert "hooks.json" hooksJsonBytes scriptFiles
+  where
+    scriptFiles =
+      Map.fromList
+        [ ( "hooks/" <> T.unpack (nameText name) <> ".sh",
+            antigravityInjectScript (hookCommand spec)
+          )
+        | (name, spec) <- Map.toAscList hooks,
+          hookInject spec
+        ]
+    hooksJsonBytes =
+      BL.toStrict
+        ( Aeson.encode
+            ( object
+                [ Key.fromText (nameText name) .= hookEntry name spec
+                | (name, spec) <- Map.toAscList hooks
+                ]
+            )
+        )
+        <> "\n"
+    hookEntry :: Name -> HookSpec -> Value
+    hookEntry name spec =
+      let evKey = Key.fromText (hookEventText (hookEvent spec))
+          cmd =
+            if hookInject spec
+              then "sh ./hooks/" <> nameText name <> ".sh"
+              else hookCommand spec
+          handlerObj =
+            object $
+              [ "type" .= ("command" :: Text),
+                "command" .= cmd
+              ]
+                ++ maybe [] (\t -> ["timeout" .= t]) (hookTimeout spec)
+          payload = case hookEvent spec of
+            PreToolUse ->
+              [ object
+                  [ "matcher" .= fromMaybe "*" (hookMatcher spec),
+                    "hooks" .= [handlerObj]
+                  ]
+              ]
+            PostToolUse ->
+              [ object
+                  [ "matcher" .= fromMaybe "*" (hookMatcher spec),
+                    "hooks" .= [handlerObj]
+                  ]
+              ]
+            SessionStart -> [handlerObj]
+            PreInvocation -> [handlerObj]
+            PostInvocation -> [handlerObj]
+            Stop -> [handlerObj]
+       in object [evKey .= payload]
+
+antigravityInjectScript :: Text -> ByteString
+antigravityInjectScript cmd =
+  encodeUtf8 $
+    T.unlines
+      [ "#!/bin/sh",
+        "set -eu",
+        "out=$(",
+        cmd,
+        ")",
+        "if [ -z \"$(printf '%s' \"$out\" | tr -d '[:space:]')\" ]; then",
+        "  printf '{}\\n'",
+        "else",
+        "  printf '%s' \"$out\" | awk '",
+        "    BEGIN { ORS = \"\"; print \"{\\\"injectSteps\\\":[{\\\"systemMessage\\\":{\\\"systemMessage\\\":\\\"\" }",
+        "    {",
+        "      gsub(/\\\\/, \"\\\\\\\\\")",
+        "      gsub(/\"/, \"\\\\\\\"\")",
+        "      gsub(/\\t/, \"\\\\t\")",
+        "      gsub(/\\r/, \"\\\\r\")",
+        "      if (NR > 1) printf \"\\\\n\"",
+        "      printf \"%s\", $0",
+        "    }",
+        "    END { print \"\\\"}}]}\\n\" }",
+        "  '",
+        "fi"
+      ]
+
+claudeHookFiles :: Map Name HookSpec -> Map FilePath ByteString
+claudeHookFiles hooks =
+  Map.singleton "hooks/hooks.json" $
+    BL.toStrict
+      ( Aeson.encode
+          ( object
+              [ "hooks"
+                  .= object
+                    [ Key.fromText evName .= groups
+                    | (evName, groups) <- Map.toAscList byEvent
+                    ]
+              ]
+          )
+      )
+      <> "\n"
+  where
+    byEvent :: Map Text [Value]
+    byEvent =
+      Map.fromListWith
+        (flip (++))
+        [ (claudeEventName (hookEvent spec), [claudeGroup spec])
+        | (_name, spec) <- Map.toAscList hooks
+        ]
+    claudeEventName :: HookEvent -> Text
+    claudeEventName = \case
+      PreInvocation -> "UserPromptSubmit"
+      ev -> hookEventText ev
+    claudeGroup :: HookSpec -> Value
+    claudeGroup spec =
+      let handlerObj =
+            object $
+              [ "type" .= ("command" :: Text),
+                "command" .= hookCommand spec
+              ]
+                ++ maybe [] (\t -> ["timeout" .= t]) (hookTimeout spec)
+       in object $
+            maybe [] (\m -> ["matcher" .= m]) (hookMatcher spec)
+              ++ ["hooks" .= [handlerObj]]

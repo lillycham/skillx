@@ -16,6 +16,7 @@ import Skillx.Check
         DanglingLink,
         DuplicateTierRoot,
         MissingBin,
+        MissingHook,
         MissingMcp,
         MissingRoot,
         Unreachable
@@ -35,8 +36,11 @@ import Skillx.Compile
 import Skillx.Graph (Dir (In, Out))
 import Skillx.Graph qualified as Graph
 import Skillx.Manifest
-  ( Manifest (manAlways, manEntry, manName, manSources, manVersion),
-    ManifestError (BadSourceSpec),
+  ( HookEvent (SessionStart),
+    HookSpec (HookSpec, hookCommand, hookEvent, hookInject, hookMatcher, hookTimeout),
+    Manifest (manAlways, manEntry, manHooks, manMcp, manName, manSources, manVersion),
+    ManifestError (BadHookSpec, BadMcpSpec, BadSourceSpec),
+    McpServer (McpHttp, McpStdio, mcpArgs, mcpCommand, mcpEnv, mcpUrl),
     Place (Place, placeDir, placeHome),
     PlaceRules (PlaceRules, prAlways, prEntry),
     SourceSpec (GitSource, LocalSource, gsRev, gsSubdir, gsUrl),
@@ -105,14 +109,16 @@ unsafeSkill ::
   [Text] ->
   [Text] ->
   [Text] ->
+  [Text] ->
   Text ->
   Skill
-unsafeSkill name desc links mcp bins body =
+unsafeSkill name desc links mcp hooks bins body =
   case mkSkill
     (unsafeName name)
     desc
     (Set.fromList (map unsafeName links))
     (Set.fromList (map unsafeName mcp))
+    (Set.fromList (map unsafeName hooks))
     (Set.fromList (map unsafeName bins))
     body of
     Right s -> s
@@ -198,10 +204,11 @@ instance Arbitrary ArbSkill where
     d <- genDesc
     ls <- Set.fromList <$> listOf genName
     mcps <- Set.fromList <$> listOf genName
+    hooks <- Set.fromList <$> listOf genName
     bins <- Set.fromList <$> listOf genName
     bodyLines <- listOf genDesc
     let body = T.unlines bodyLines
-    case mkSkill n d ls mcps bins body of
+    case mkSkill n d ls mcps hooks bins body of
       Right s -> pure (ArbSkill s)
       Left err -> error (show err)
 
@@ -251,14 +258,13 @@ manifestTests :: TestTree
 manifestTests =
   testGroup
     "Manifest"
-    [ testCase "parses full manifest and resolves place rules" $ do
+    [ testCase "parses full manifest, mcp, hooks and resolves place rules" $ do
         let toml =
               T.unlines
                 [ "name = \"dev-bundle\"",
                   "version = \"0.2.0\"",
                   "always = [\"core-rules\"]",
                   "entry = [\"rust-dev\"]",
-                  "available-mcp = [\"akyuu\"]",
                   "available-bins = [\"cargo\", \"git\"]",
                   "",
                   "[places.\"~/devel/garden\"]",
@@ -270,7 +276,19 @@ manifestTests =
                   "[sources.remote]",
                   "git = \"https://example.com/skills.git\"",
                   "rev = \"deadbeef\"",
-                  "subdir = \"contrib/skills\""
+                  "subdir = \"contrib/skills\"",
+                  "",
+                  "[mcp.akyuu]",
+                  "command = \"akyuu\"",
+                  "args = [\"mcp\"]",
+                  "",
+                  "[mcp.remote-api]",
+                  "url = \"https://example.com/mcp\"",
+                  "",
+                  "[hooks.akyuu-context]",
+                  "event = \"SessionStart\"",
+                  "command = \"akyuu context --page 1\"",
+                  "inject = true"
                 ]
         case parseManifest toml of
           Left err -> assertBool ("unexpected error: " <> show err) False
@@ -304,15 +322,47 @@ manifestTests =
                   { gsUrl = "https://example.com/skills.git",
                     gsRev = Just "deadbeef",
                     gsSubdir = Just "contrib/skills"
+                  }
+            Map.lookup (unsafeName "akyuu") (manMcp m)
+              @?= Just
+                McpStdio
+                  { mcpCommand = "akyuu",
+                    mcpArgs = ["mcp"],
+                    mcpEnv = Map.empty
+                  }
+            Map.lookup (unsafeName "remote-api") (manMcp m)
+              @?= Just McpHttp {mcpUrl = "https://example.com/mcp"}
+            Map.lookup (unsafeName "akyuu-context") (manHooks m)
+              @?= Just
+                HookSpec
+                  { hookEvent = SessionStart,
+                    hookCommand = "akyuu context --page 1",
+                    hookMatcher = Nothing,
+                    hookInject = True,
+                    hookTimeout = Nothing
                   },
-      testCase "rejects source with both path and git" $ do
-        let bad =
+      testCase "rejects invalid source, mcp and hook specs" $ do
+        let badSrc =
               T.unlines
                 [ "[sources.bad]",
                   "path = \"./a\"",
                   "git = \"https://example.com/a.git\""
                 ]
-        parseManifest bad @?= Left (BadSourceSpec "bad")
+            badMcp =
+              T.unlines
+                [ "[mcp.bad]",
+                  "command = \"foo\"",
+                  "url = \"https://example.com/mcp\""
+                ]
+            badHook =
+              T.unlines
+                [ "[hooks.bad]",
+                  "event = \"NotAnEvent\"",
+                  "command = \"echo hi\""
+                ]
+        parseManifest badSrc @?= Left (BadSourceSpec "bad")
+        parseManifest badMcp @?= Left (BadMcpSpec "bad")
+        parseManifest badHook @?= Left (BadHookSpec "bad")
     ]
 
 -- Check tests ------------------------------------------------------------
@@ -328,6 +378,7 @@ checkTests =
                 "Entry point for Rust work."
                 ["rust-cargo", "missing-leaf"]
                 ["akyuu"]
+                ["missing-hook"]
                 ["cargo"]
                 "Use rust-cargo for builds."
             sCargo =
@@ -336,12 +387,14 @@ checkTests =
                 "Cargo build helper."
                 ["rust-dev"]
                 []
+                []
                 ["missing-bin"]
                 "Run cargo check."
             sOrphan =
               unsafeSkill
                 "orphan-skill"
                 "Never linked."
+                []
                 []
                 []
                 []
@@ -369,6 +422,7 @@ checkTests =
           [ (Problem, MissingRoot, unsafeName "ghost-root"),
             (Problem, DanglingLink, unsafeName "rust-dev"),
             (Problem, MissingMcp, unsafeName "rust-dev"),
+            (Problem, MissingHook, unsafeName "rust-dev"),
             (Problem, MissingBin, unsafeName "rust-cargo"),
             (Suggestion, CycleMember, unsafeName "rust-cargo"),
             (Suggestion, CycleMember, unsafeName "rust-dev"),
@@ -387,7 +441,8 @@ sampleStore =
           "core-rules"
           "Core workflow rules."
           []
-          []
+          ["akyuu"]
+          ["akyuu-context"]
           []
           "Always use declarative builds."
       sHub =
@@ -396,6 +451,7 @@ sampleStore =
           "Rust conventions and entry point."
           ["rust-cargo", "rust-debug"]
           ["akyuu"]
+          []
           ["cargo"]
           "Follow standard Rust conventions."
       sCargo =
@@ -403,6 +459,7 @@ sampleStore =
           "rust-cargo"
           "Run Cargo builds and tests."
           ["rust-debug"]
+          []
           []
           ["cargo"]
           "Use cargo test."
@@ -413,12 +470,14 @@ sampleStore =
           []
           []
           []
+          []
           "Inspect compiler errors."
       sGarden =
         unsafeSkill
           "garden-deploy"
           "Deploy the garden app."
           []
+          ["garden-mcp"]
           []
           []
           "Run deploy script."
@@ -442,11 +501,22 @@ sampleManifest =
         "version = \"1.0.0\"",
         "always = [\"core-rules\"]",
         "entry = [\"rust-dev\"]",
-        "available-mcp = [\"akyuu\"]",
         "available-bins = [\"cargo\"]",
         "",
         "[places.\"~/devel/garden\"]",
-        "entry = [\"garden-deploy\"]"
+        "entry = [\"garden-deploy\"]",
+        "",
+        "[mcp.akyuu]",
+        "command = \"akyuu\"",
+        "args = [\"mcp\"]",
+        "",
+        "[mcp.garden-mcp]",
+        "command = \"garden-mcp\"",
+        "",
+        "[hooks.akyuu-context]",
+        "event = \"SessionStart\"",
+        "command = \"akyuu context --page 1\"",
+        "inject = true"
       ] of
     Right m -> m
     Left err -> error (show err)
@@ -468,15 +538,31 @@ compileTests =
         let place = Place {placeHome = "/home/u", placeDir = "/home/u/devel/garden"}
             tiersAtPlace = assignTiers skills sampleManifest (Just place)
         Map.lookup (unsafeName "garden-deploy") tiersAtPlace @?= Just TierEntry,
-      testCase "compiles ClaudeCode and Antigravity plugin trees with relocatable routing footers" $ do
+      testCase "compiles ClaudeCode and Antigravity plugin trees with closure-driven MCP, hooks and routing footers" $ do
         let FileTree claudeFiles =
               mustRight (compile sampleStore sampleManifest ClaudeCode Nothing)
             FileTree agyFiles =
               mustRight (compile sampleStore sampleManifest Antigravity Nothing)
+            place = Place {placeHome = "/home/u", placeDir = "/home/u/devel/garden"}
+            FileTree agyGardenFiles =
+              mustRight (compile sampleStore sampleManifest Antigravity (Just place))
         assertBool "Claude has .claude-plugin/plugin.json" $
           Map.member ".claude-plugin/plugin.json" claudeFiles
-        assertBool "Antigravity has plugin.json" $
+        assertBool "Claude has .mcp.json and hooks/hooks.json" $
+          Map.member ".mcp.json" claudeFiles
+            && Map.member "hooks/hooks.json" claudeFiles
+        assertBool "Antigravity has plugin.json, mcp_config.json, hooks.json and inject script" $
           Map.member "plugin.json" agyFiles
+            && Map.member "mcp_config.json" agyFiles
+            && Map.member "hooks.json" agyFiles
+            && Map.member "hooks/akyuu-context.sh" agyFiles
+        let globalMcp = decodeUtf8 (fromMaybe "" (Map.lookup "mcp_config.json" agyFiles))
+            gardenMcp = decodeUtf8 (fromMaybe "" (Map.lookup "mcp_config.json" agyGardenFiles))
+        assertBool "global MCP config includes akyuu but not place-scoped garden-mcp" $
+          "\"akyuu\"" `T.isInfixOf` globalMcp
+            && not ("\"garden-mcp\"" `T.isInfixOf` globalMcp)
+        assertBool "place-scoped MCP config pulls in garden-mcp" $
+          "\"garden-mcp\"" `T.isInfixOf` gardenMcp
         assertBool "Always rule emitted in rules/core-rules.md" $
           Map.member "rules/core-rules.md" claudeFiles
         assertBool "Leaf auxiliary file copied to _nodes/rust-cargo/scripts/run.sh" $

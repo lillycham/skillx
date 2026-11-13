@@ -36,8 +36,16 @@ let
     sources.local = /store/skills;
     always = [ "core-rules" ];
     entry = [ "rust-dev" ];
-    availableMcp = [ "akyuu" ];
     availableBins = [ "cargo" ];
+    mcp.akyuu = {
+      command = "akyuu";
+      args = [ "mcp" ];
+    };
+    hooks.akyuu-context = {
+      event = "SessionStart";
+      command = "akyuu context --page 1";
+      inject = true;
+    };
     places."~/devel/garden-app".entry = [ "garden-deploy" ];
     targets.claudeCode.enable = true;
     targets.antigravity.enable = true;

@@ -50,6 +50,67 @@ let
     };
   };
 
+  mcpType = types.submodule {
+    options = {
+      command = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Executable command for a stdio MCP server.";
+      };
+      args = mkOption {
+        type = types.listOf types.str;
+        default = [ ];
+        description = "Command-line arguments for a stdio MCP server.";
+      };
+      env = mkOption {
+        type = types.attrsOf types.str;
+        default = { };
+        description = "Environment variables for a stdio MCP server.";
+      };
+      url = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Endpoint URL for a Streamable HTTP MCP server.";
+      };
+    };
+  };
+
+  hookType = types.submodule {
+    options = {
+      event = mkOption {
+        type = types.enum [
+          "SessionStart"
+          "PreToolUse"
+          "PostToolUse"
+          "PreInvocation"
+          "UserPromptSubmit"
+          "PostInvocation"
+          "Stop"
+        ];
+        description = "Lifecycle event when the hook fires.";
+      };
+      command = mkOption {
+        type = types.str;
+        description = "Shell command to execute.";
+      };
+      matcher = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Optional tool matcher regex for PreToolUse and PostToolUse.";
+      };
+      inject = mkOption {
+        type = types.bool;
+        default = false;
+        description = "Whether stdout is plain text to inject as a system message.";
+      };
+      timeout = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        description = "Optional execution timeout in seconds.";
+      };
+    };
+  };
+
   targetSubmodule = defaultDir:
     types.submodule {
       options = {
@@ -66,6 +127,20 @@ let
     optionalAttrs (p.always != [ ]) { inherit (p) always; }
     // optionalAttrs (p.entry != [ ]) { inherit (p) entry; };
 
+  mcpToml = m:
+    optionalAttrs (m.command != null) { inherit (m) command; }
+    // optionalAttrs (m.args != [ ]) { inherit (m) args; }
+    // optionalAttrs (m.env != { }) { inherit (m) env; }
+    // optionalAttrs (m.url != null) { inherit (m) url; };
+
+  hookToml = h:
+    {
+      inherit (h) event command;
+    }
+    // optionalAttrs (h.matcher != null) { inherit (h) matcher; }
+    // optionalAttrs h.inject { inherit (h) inject; }
+    // optionalAttrs (h.timeout != null) { inherit (h) timeout; };
+
   sourceToml = path: { path = toString path; };
 
   manifestAttr =
@@ -77,6 +152,8 @@ let
         // optionalAttrs (cfg.availableBins != null) { available-bins = cfg.availableBins; }
         // optionalAttrs (cfg.places != { }) { places = mapAttrs (_: placeToml) cfg.places; }
         // optionalAttrs (cfg.sources != { }) { sources = mapAttrs (_: sourceToml) cfg.sources; }
+        // optionalAttrs (cfg.mcp != { }) { mcp = mapAttrs (_: mcpToml) cfg.mcp; }
+        // optionalAttrs (cfg.hooks != { }) { hooks = mapAttrs (_: hookToml) cfg.hooks; }
       )
       cfg.settings;
 
@@ -171,6 +248,35 @@ in
         }
       '';
       description = "Directory-scoped Tier 0 and Tier 1 roots.";
+    };
+
+    mcp = mkOption {
+      type = types.attrsOf mcpType;
+      default = { };
+      example = literalExpression ''
+        {
+          akyuu = {
+            command = "akyuu";
+            args = [ "mcp" ];
+          };
+        }
+      '';
+      description = "MCP servers declared in the manifest and emitted when required by reachable skills.";
+    };
+
+    hooks = mkOption {
+      type = types.attrsOf hookType;
+      default = { };
+      example = literalExpression ''
+        {
+          akyuu-context = {
+            event = "SessionStart";
+            command = "akyuu context --page 1";
+            inject = true;
+          };
+        }
+      '';
+      description = "Lifecycle hooks declared in the manifest and emitted when required by reachable skills.";
     };
 
     availableMcp = mkOption {

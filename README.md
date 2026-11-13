@@ -21,13 +21,14 @@ name: rust-dev
 description: Rust conventions and entry point to the other Rust skills.
 links: rust-cargo, rust-debug
 requires-mcp: akyuu
+requires-hook: akyuu-context
 requires-bin: cargo, rustc
 ---
 
 Body of the skill in Markdown.
 ```
 
-At compile time, `skillx` strips `links`, `requires-mcp`, and `requires-bin` from the emitted harness `SKILL.md` frontmatter and appends a relocatable `## Linked skills` routing section with each target skill's description and relative path.
+At compile time, `skillx` strips `links`, `requires-mcp`, `requires-hook`, and `requires-bin` from the emitted harness `SKILL.md` frontmatter, appends a relocatable `## Linked skills` routing section with each target skill's description and relative path, and emits only the MCP servers and lifecycle hooks required by the active skill closure.
 
 ## Manifest (`skillx.toml`)
 
@@ -36,7 +37,6 @@ name = "my-skills"
 version = "0.1.0"
 always = ["core-rules"]
 entry = ["rust-dev"]
-available-mcp = ["akyuu"]
 available-bins = ["cargo", "rustc", "git"]
 
 [places."~/devel/garden-app"]
@@ -44,6 +44,15 @@ entry = ["garden-deploy"]
 
 [sources.local]
 path = "./skills"
+
+[mcp.akyuu]
+command = "akyuu"
+args = ["mcp"]
+
+[hooks.akyuu-context]
+event = "SessionStart"
+command = "akyuu context --page 1"
+inject = true
 ```
 
 ## Commands

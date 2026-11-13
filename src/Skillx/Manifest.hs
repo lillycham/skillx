@@ -26,21 +26,36 @@
 -- > git = "https://example.com/skills.git"
 -- > rev = "a1b2c3d"
 -- > subdir = "skills"
+-- > [mcp.akyuu]
+-- > command = "akyuu"
+-- > args = ["--root", "/path/to/store", "mcp"]
+-- >
+-- > [hooks.akyuu-context]
+-- > event = "SessionStart"
+-- > command = "akyuu context --page 1"
+-- > inject = true
 module Skillx.Manifest
   ( -- * Types
     Manifest (..),
     PlaceRules (..),
     SourceSpec (..),
+    McpServer (..),
+    HookEvent (..),
+    HookSpec (..),
     Place (..),
     ManifestError (..),
 
     -- * Parsing
     parseManifest,
+    parseHookEvent,
+    hookEventText,
 
     -- * Queries
     allRoots,
     globalRoots,
     matchingPlaceRules,
+    knownMcp,
+    knownHooks,
   )
 where
 
@@ -48,7 +63,7 @@ import Data.Bifunctor (first)
 import Data.List (nub)
 import Data.Map.Strict (Map)
 import Data.Map.Strict qualified as Map
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, isNothing)
 import Data.Set (Set)
 import Data.Set qualified as Set
 import Data.Text (Text)
@@ -71,8 +86,12 @@ data Manifest = Manifest
     manPlaces :: Map Text PlaceRules,
     -- | Declared skill sources, keyed by source name.
     manSources :: Map Text SourceSpec,
-    -- | MCP servers available in the target environment (if @Just@, checked by
-    -- @skillx check@).
+    -- | MCP server configurations, keyed by server name.
+    manMcp :: Map Name McpServer,
+    -- | Lifecycle hook configurations, keyed by hook name.
+    manHooks :: Map Name HookSpec,
+    -- | Extra MCP servers available in the target environment (merged with
+    -- @manMcp@ keys by 'knownMcp').
     manAvailableMcp :: Maybe (Set Name),
     -- | Binaries available on @PATH@ in the target environment (if @Just@,
     -- checked by @skillx check@).
@@ -99,6 +118,68 @@ data SourceSpec
       }
   deriving (Eq, Show)
 
+-- | An MCP server definition in @[mcp.<name>]@.
+data McpServer
+  = -- | A local stdio MCP server process.
+    McpStdio
+      { mcpCommand :: Text,
+        mcpArgs :: [Text],
+        mcpEnv :: Map Text Text
+      }
+  | -- | A remote Streamable HTTP MCP server endpoint.
+    McpHttp
+      { mcpUrl :: Text
+      }
+  deriving (Eq, Show)
+
+-- | Lifecycle events at which a hook can run.
+data HookEvent
+  = SessionStart
+  | PreToolUse
+  | PostToolUse
+  | PreInvocation
+  | PostInvocation
+  | Stop
+  deriving (Eq, Ord, Show, Enum, Bounded)
+
+-- | Parse a 'HookEvent' name.
+parseHookEvent :: Text -> Maybe HookEvent
+parseHookEvent = \case
+  "SessionStart" -> Just SessionStart
+  "PreToolUse" -> Just PreToolUse
+  "PostToolUse" -> Just PostToolUse
+  "PreInvocation" -> Just PreInvocation
+  "UserPromptSubmit" -> Just PreInvocation
+  "PostInvocation" -> Just PostInvocation
+  "Stop" -> Just Stop
+  _ -> Nothing
+
+-- | Canonical event name for 'HookEvent'.
+hookEventText :: HookEvent -> Text
+hookEventText = \case
+  SessionStart -> "SessionStart"
+  PreToolUse -> "PreToolUse"
+  PostToolUse -> "PostToolUse"
+  PreInvocation -> "PreInvocation"
+  PostInvocation -> "PostInvocation"
+  Stop -> "Stop"
+
+-- | A lifecycle hook definition in @[hooks.<name>]@.
+data HookSpec = HookSpec
+  { -- | Lifecycle event when the hook fires.
+    hookEvent :: HookEvent,
+    -- | Shell command to execute.
+    hookCommand :: Text,
+    -- | Optional tool matcher regex (used by @PreToolUse@ and @PostToolUse@).
+    hookMatcher :: Maybe Text,
+    -- | When @True@, the command's plain-text @stdout@ is injected as a
+    -- system message (wrapped automatically for harnesses that expect JSON).
+    hookInject :: Bool,
+    -- | Optional timeout in seconds.
+    hookTimeout :: Maybe Int
+  }
+  deriving (Eq, Show)
+
 -- | A working directory context for evaluating directory-scoped @places@.
 data Place = Place
   { placeHome :: Text,
@@ -110,10 +191,15 @@ data Place = Place
 data ManifestError
   = -- | The TOML syntax or schema is invalid.
     TomlError [Text]
-  | -- | A skill, MCP or binary name in the manifest is not a valid 'Name'.
+  | -- | A skill, MCP, hook or binary name in the manifest is not a valid 'Name'.
     BadManifestName Text Text NameError
   | -- | A @[sources.<name>]@ entry specifies neither @path@ nor @git@, or both.
     BadSourceSpec Text
+  | -- | A @[mcp.<name>]@ entry specifies neither @command@ nor @url@, or both.
+    BadMcpSpec Text
+  | -- | A @[hooks.<name>]@ entry has an unknown @event@, empty @command@, or
+    -- non-positive @timeout@.
+    BadHookSpec Text
   | -- | The plugin @name@ or @version@ is empty.
     EmptyMetadata Text
   deriving (Eq, Show)
@@ -127,6 +213,8 @@ data RawManifest = RawManifest
     rmEntry :: Maybe [Text],
     rmPlaces :: Maybe (Map Text RawPlace),
     rmSources :: Maybe (Map Text RawSource),
+    rmMcp :: Maybe (Map Text RawMcp),
+    rmHooks :: Maybe (Map Text RawHook),
     rmAvailableMcp :: Maybe [Text],
     rmAvailableBins :: Maybe [Text]
   }
@@ -143,6 +231,21 @@ data RawSource = RawSource
     rsSubdir :: Maybe Text
   }
 
+data RawMcp = RawMcp
+  { rmcpCommand :: Maybe Text,
+    rmcpArgs :: Maybe [Text],
+    rmcpEnv :: Maybe (Map Text Text),
+    rmcpUrl :: Maybe Text
+  }
+
+data RawHook = RawHook
+  { rhEvent :: Maybe Text,
+    rhCommand :: Maybe Text,
+    rhMatcher :: Maybe Text,
+    rhInject :: Maybe Bool,
+    rhTimeout :: Maybe Int
+  }
+
 instance FromValue RawManifest where
   fromValue =
     parseTableFromValue $
@@ -153,6 +256,8 @@ instance FromValue RawManifest where
         <*> optKey "entry"
         <*> optKey "places"
         <*> optKey "sources"
+        <*> optKey "mcp"
+        <*> optKey "hooks"
         <*> optKey "available-mcp"
         <*> optKey "available-bins"
 
@@ -171,6 +276,25 @@ instance FromValue RawSource where
         <*> optKey "git"
         <*> optKey "rev"
         <*> optKey "subdir"
+
+instance FromValue RawMcp where
+  fromValue =
+    parseTableFromValue $
+      RawMcp
+        <$> optKey "command"
+        <*> optKey "args"
+        <*> optKey "env"
+        <*> optKey "url"
+
+instance FromValue RawHook where
+  fromValue =
+    parseTableFromValue $
+      RawHook
+        <$> optKey "event"
+        <*> optKey "command"
+        <*> optKey "matcher"
+        <*> optKey "inject"
+        <*> optKey "timeout"
 
 -- | Parse a @skillx.toml@ document.
 parseManifest :: Text -> Either ManifestError Manifest
@@ -201,6 +325,16 @@ validateRaw rm = do
       <$> traverse
         (\(k, rs) -> (k,) <$> validateSource k rs)
         (Map.toAscList (fromMaybe Map.empty (rmSources rm)))
+  mcp <-
+    Map.fromList
+      <$> traverse
+        (\(k, r) -> validateMcp k r)
+        (Map.toAscList (fromMaybe Map.empty (rmMcp rm)))
+  hooks <-
+    Map.fromList
+      <$> traverse
+        (\(k, r) -> validateHook k r)
+        (Map.toAscList (fromMaybe Map.empty (rmHooks rm)))
   availMcp <-
     traverse
       (fmap Set.fromList . parseNameList "available-mcp")
@@ -217,6 +351,8 @@ validateRaw rm = do
         manEntry = nub entry,
         manPlaces = places,
         manSources = sources,
+        manMcp = mcp,
+        manHooks = hooks,
         manAvailableMcp = availMcp,
         manAvailableBins = availBins
       }
@@ -241,6 +377,58 @@ validateRaw rm = do
                     gsSubdir = T.unpack <$> rsSubdir rs
                   }
         _ -> Left (BadSourceSpec k)
+    validateMcp k r = do
+      n <- first (BadManifestName "mcp" k) (mkName k)
+      case (rmcpCommand r, rmcpUrl r) of
+        (Just cmd, Nothing)
+          | not (T.null (T.strip cmd)) ->
+              Right
+                ( n,
+                  McpStdio
+                    { mcpCommand = cmd,
+                      mcpArgs = fromMaybe [] (rmcpArgs r),
+                      mcpEnv = fromMaybe Map.empty (rmcpEnv r)
+                    }
+                )
+        (Nothing, Just u)
+          | not (T.null (T.strip u))
+              && isNothing (rmcpArgs r)
+              && isNothing (rmcpEnv r) ->
+              Right (n, McpHttp {mcpUrl = u})
+        _ -> Left (BadMcpSpec k)
+    validateHook k r = do
+      n <- first (BadManifestName "hooks" k) (mkName k)
+      evRaw <- maybe (Left (BadHookSpec k)) Right (rhEvent r)
+      ev <- maybe (Left (BadHookSpec k)) Right (parseHookEvent evRaw)
+      cmd <- maybe (Left (BadHookSpec k)) Right (rhCommand r)
+      if T.null (T.strip cmd)
+        then Left (BadHookSpec k)
+        else pure ()
+      case rhTimeout r of
+        Just t | t <= 0 -> Left (BadHookSpec k)
+        _ -> pure ()
+      Right
+        ( n,
+          HookSpec
+            { hookEvent = ev,
+              hookCommand = cmd,
+              hookMatcher = rhMatcher r,
+              hookInject = fromMaybe False (rhInject r),
+              hookTimeout = rhTimeout r
+            }
+        )
+
+-- | Known MCP servers from @[mcp.<name>]@ and @available-mcp@, or @Nothing@
+-- when neither is configured.
+knownMcp :: Manifest -> Maybe (Set Name)
+knownMcp m
+  | Map.null (manMcp m) && isNothing (manAvailableMcp m) = Nothing
+  | otherwise =
+      Just (Map.keysSet (manMcp m) <> fromMaybe Set.empty (manAvailableMcp m))
+
+-- | Known hooks from @[hooks.<name>]@.
+knownHooks :: Manifest -> Set Name
+knownHooks = Map.keysSet . manHooks
 
 -- | The global root skills (@always@ and @entry@), excluding @places@.
 globalRoots :: Manifest -> Set Name

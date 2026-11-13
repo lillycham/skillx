@@ -53,11 +53,12 @@
                 mac.homeFiles == [ ".claude/plugins/dev-skills" ".gemini/config/plugins/dev-skills" ]
                 && linux.homeFiles == mac.homeFiles
               )
-              && expect "manifest holds tiers, places and capabilities" (
+              && expect "manifest holds tiers, places, mcp and hooks" (
                 mac.manifest.name == "dev-skills"
                 && mac.manifest.always == [ "core-rules" ]
                 && mac.manifest.entry == [ "rust-dev" ]
-                && mac.manifest.available-mcp == [ "akyuu" ]
+                && mac.manifest.mcp.akyuu.command == "akyuu"
+                && mac.manifest.hooks.akyuu-context.event == "SessionStart"
                 && mac.manifest.places."~/devel/garden-app".entry == [ "garden-deploy" ]
               );
           in

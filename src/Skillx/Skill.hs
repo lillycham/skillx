@@ -10,6 +10,7 @@
 -- > description: Rust conventions and entry point to the other Rust skills.
 -- > links: rust-cargo, rust-debug
 -- > requires-mcp: akyuu
+-- > requires-hook: akyuu-context
 -- > requires-bin: cargo, rustc
 -- > ---
 -- >
@@ -18,9 +19,9 @@
 -- Rules of the format:
 --
 -- * @name@ and @description@ are required and appear once, in that order.
--- * @links@, @requires-mcp@ and @requires-bin@ are optional. Each appears at
---   most once, in that order, only when its set is non-empty, with values in
---   ascending order separated by @", "@.
+-- * @links@, @requires-mcp@, @requires-hook@ and @requires-bin@ are optional.
+--   Each appears at most once, in that order, only when its set is non-empty,
+--   with values in ascending order separated by @", "@.
 -- * For every skill @s@ constructed with 'mkSkill',
 --   @parseSkill (renderSkill s) == Right s@, and for every @bs@ accepted by
 --   'parseSkill', @renderSkill s == bs@.
@@ -31,6 +32,7 @@ module Skillx.Skill
         skillDescription,
         skillLinks,
         skillRequiresMcp,
+        skillRequiresHook,
         skillRequiresBin,
         skillBody
       ),
@@ -71,6 +73,8 @@ data Skill = Skill
     skillLinks :: Set Name,
     -- | MCP servers required by this skill.
     skillRequiresMcp :: Set Name,
+    -- | Lifecycle hooks required by this skill.
+    skillRequiresHook :: Set Name,
     -- | CLI binaries required on @PATH@ by this skill.
     skillRequiresBin :: Set Name,
     -- | The Markdown body of the skill.
@@ -103,8 +107,8 @@ data SkillParseError
     MalformedHeader Text
   | -- | A header value is invalid.
     BadHeaderValue Text Text
-  | -- | A 'Name' in @name@, @links@, @requires-mcp@ or @requires-bin@ is not
-    -- valid.
+  | -- | A 'Name' in @name@, @links@, @requires-mcp@, @requires-hook@ or
+    -- @requires-bin@ is not valid.
     BadHeaderName Text NameError
   | -- | The file is a valid skill, but its bytes are not in the canonical form
     -- produced by 'renderSkill'.
@@ -126,9 +130,10 @@ mkSkill ::
   Set Name ->
   Set Name ->
   Set Name ->
+  Set Name ->
   Text ->
   Either SkillError Skill
-mkSkill name desc links mcp bins body
+mkSkill name desc links mcp hooks bins body
   | not (validDescription desc) = Left (InvalidDescription desc)
   | otherwise =
       Right
@@ -137,6 +142,7 @@ mkSkill name desc links mcp bins body
             skillDescription = desc,
             skillLinks = links,
             skillRequiresMcp = mcp,
+            skillRequiresHook = hooks,
             skillRequiresBin = bins,
             skillBody = body
           }
@@ -152,6 +158,7 @@ renderSkill s =
       ]
         ++ optSet "links" (skillLinks s)
         ++ optSet "requires-mcp" (skillRequiresMcp s)
+        ++ optSet "requires-hook" (skillRequiresHook s)
         ++ optSet "requires-bin" (skillRequiresBin s)
     optSet key vals
       | Set.null vals = []
@@ -166,6 +173,7 @@ knownHeaders =
       "description",
       "links",
       "requires-mcp",
+      "requires-hook",
       "requires-bin"
     ]
 
@@ -213,9 +221,10 @@ parseSkillLenient bs = do
   name <- first (BadHeaderName "name") (mkName nameRaw)
   links <- parseNameSet "links" (Map.findWithDefault [] "links" groups)
   mcp <- parseNameSet "requires-mcp" (Map.findWithDefault [] "requires-mcp" groups)
+  hooks <- parseNameSet "requires-hook" (Map.findWithDefault [] "requires-hook" groups)
   bins <- parseNameSet "requires-bin" (Map.findWithDefault [] "requires-bin" groups)
   first (\(InvalidDescription d) -> BadHeaderValue "description" d) $
-    mkSkill name descRaw links mcp bins body
+    mkSkill name descRaw links mcp hooks bins body
   where
     checkKnown k
       | k `Set.member` knownHeaders = Right ()

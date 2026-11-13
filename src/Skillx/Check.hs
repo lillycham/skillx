@@ -28,12 +28,17 @@ import Data.Text qualified as T
 import Skillx.Graph (Graph)
 import Skillx.Graph qualified as Graph
 import Skillx.Manifest
-  ( Manifest (manAlways, manAvailableBins, manAvailableMcp, manEntry, manPlaces),
+  ( Manifest (manAlways, manAvailableBins, manEntry, manPlaces),
     PlaceRules (prAlways, prEntry),
     allRoots,
+    knownHooks,
+    knownMcp,
   )
 import Skillx.Name (Name, nameText)
-import Skillx.Skill (Skill (skillLinks, skillRequiresBin, skillRequiresMcp), skillGraph)
+import Skillx.Skill
+  ( Skill (skillLinks, skillRequiresBin, skillRequiresHook, skillRequiresMcp),
+    skillGraph,
+  )
 
 -- | How urgent a finding is. 'Problem' sorts before 'Suggestion'.
 data Severity
@@ -49,8 +54,11 @@ data FindingKind
     MissingRoot
   | -- | A skill links to one or more skills that are not in the store.
     DanglingLink
-  | -- | A reachable skill requires MCP servers not in @available-mcp@.
+  | -- | A reachable skill requires MCP servers not in @[mcp]@ or
+    -- @available-mcp@.
     MissingMcp
+  | -- | A reachable skill requires hooks not in @[hooks]@.
+    MissingHook
   | -- | A reachable skill requires binaries not in @available-bins@.
     MissingBin
   | -- | A skill participates in a directed link cycle.
@@ -83,6 +91,7 @@ kindText = \case
   MissingRoot -> "missing-root"
   DanglingLink -> "dangling-link"
   MissingMcp -> "missing-mcp"
+  MissingHook -> "missing-hook"
   MissingBin -> "missing-bin"
   CycleMember -> "cycle"
   Unreachable -> "unreachable"
@@ -100,6 +109,7 @@ check store manifest =
     ( missingRootFindings
         ++ danglingFindings
         ++ mcpFindings
+        ++ hookFindings
         ++ binFindings
         ++ cycleFindings
         ++ unreachableFindings
@@ -151,7 +161,7 @@ check store manifest =
       ]
 
     mcpFindings :: [Finding]
-    mcpFindings = case manAvailableMcp manifest of
+    mcpFindings = case knownMcp manifest of
       Nothing -> []
       Just avail ->
         [ Finding
@@ -169,6 +179,25 @@ check store manifest =
           let missing = skillRequiresMcp s `Set.difference` avail,
           not (Set.null missing)
         ]
+
+    hookFindings :: [Finding]
+    hookFindings =
+      let avail = knownHooks manifest
+       in [ Finding
+              { findingSeverity = Problem,
+                findingKind = MissingHook,
+                findingSubject = name,
+                findingRelated = Set.toAscList missing,
+                findingDetail =
+                  nameText name
+                    <> " requires unconfigured hook(s): "
+                    <> T.intercalate ", " (map nameText (Set.toAscList missing))
+              }
+          | name <- Set.toAscList reached,
+            Just s <- [Map.lookup name store],
+            let missing = skillRequiresHook s `Set.difference` avail,
+            not (Set.null missing)
+          ]
 
     binFindings :: [Finding]
     binFindings = case manAvailableBins manifest of
