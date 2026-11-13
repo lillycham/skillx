@@ -80,7 +80,13 @@ import Skillx.Store
     loadMultiStore,
     writeFileTree,
   )
-import System.Directory (doesFileExist, getHomeDirectory, listDirectory)
+import System.Directory
+  ( XdgDirectory (XdgConfig),
+    doesFileExist,
+    getHomeDirectory,
+    getXdgDirectory,
+    listDirectory,
+  )
 import System.Exit (ExitCode (ExitFailure, ExitSuccess), exitWith)
 import System.FilePath (takeDirectory, (</>))
 import System.IO (stderr)
@@ -95,7 +101,7 @@ data Command
 
 -- | Options for @skillx check@.
 data CheckOpts = CheckOpts
-  { coManifest :: FilePath,
+  { coManifest :: Maybe FilePath,
     coStore :: Maybe FilePath,
     coLenient :: Bool
   }
@@ -103,7 +109,7 @@ data CheckOpts = CheckOpts
 
 -- | Options for @skillx build@.
 data BuildOpts = BuildOpts
-  { boManifest :: FilePath,
+  { boManifest :: Maybe FilePath,
     boStore :: Maybe FilePath,
     boHarness :: Harness,
     boOutDir :: FilePath,
@@ -114,7 +120,7 @@ data BuildOpts = BuildOpts
 
 -- | Options for @skillx graph@.
 data GraphOpts = GraphOpts
-  { goManifest :: FilePath,
+  { goManifest :: Maybe FilePath,
     goStore :: Maybe FilePath,
     goPlace :: Maybe Text,
     goLenient :: Bool
@@ -160,16 +166,21 @@ commandParser =
           (info (CmdFmt <$> fmtOptsParser) (progDesc "Format SKILL.md files into canonical form"))
     )
 
+manifestOptParser :: Parser (Maybe FilePath)
+manifestOptParser =
+  optional
+    ( strOption
+        ( long "manifest"
+            <> short 'm'
+            <> metavar "FILE"
+            <> help "Path to skillx.toml (default: ./skillx.toml or $XDG_CONFIG_HOME/skillx/skillx.toml)"
+        )
+    )
+
 checkOptsParser :: Parser CheckOpts
 checkOptsParser =
   CheckOpts
-    <$> strOption
-      ( long "manifest"
-          <> short 'm'
-          <> metavar "FILE"
-          <> value "skillx.toml"
-          <> help "Path to skillx.toml (default: skillx.toml)"
-      )
+    <$> manifestOptParser
     <*> optional
       ( strOption
           ( long "store"
@@ -186,13 +197,7 @@ checkOptsParser =
 buildOptsParser :: Parser BuildOpts
 buildOptsParser =
   BuildOpts
-    <$> strOption
-      ( long "manifest"
-          <> short 'm'
-          <> metavar "FILE"
-          <> value "skillx.toml"
-          <> help "Path to skillx.toml (default: skillx.toml)"
-      )
+    <$> manifestOptParser
     <*> optional
       ( strOption
           ( long "store"
@@ -229,13 +234,7 @@ buildOptsParser =
 graphOptsParser :: Parser GraphOpts
 graphOptsParser =
   GraphOpts
-    <$> strOption
-      ( long "manifest"
-          <> short 'm'
-          <> metavar "FILE"
-          <> value "skillx.toml"
-          <> help "Path to skillx.toml (default: skillx.toml)"
-      )
+    <$> manifestOptParser
     <*> optional
       ( strOption
           ( long "store"
@@ -287,16 +286,33 @@ execute = \case
   CmdGraph opts -> runGraph opts
   CmdFmt opts -> runFmt opts
 
+resolveManifestPath :: Maybe FilePath -> IO (Either Text FilePath)
+resolveManifestPath (Just p) = do
+  exists <- doesFileExist p
+  if exists
+    then pure (Right p)
+    else pure (Left ("manifest file not found: " <> T.pack p))
+resolveManifestPath Nothing = do
+  cwdExists <- doesFileExist "skillx.toml"
+  if cwdExists
+    then pure (Right "skillx.toml")
+    else do
+      xdgPath <- getXdgDirectory XdgConfig "skillx/skillx.toml"
+      xdgExists <- doesFileExist xdgPath
+      if xdgExists
+        then pure (Right xdgPath)
+        else pure (Left "manifest file not found: skillx.toml (or ~/.config/skillx/skillx.toml)")
+
 loadWorkspace ::
-  FilePath ->
+  Maybe FilePath ->
   Maybe FilePath ->
   Bool ->
   IO (Either Text (Manifest, Map Name SkillPackage))
-loadWorkspace manifestPath mStoreOverride lenient = do
-  exists <- doesFileExist manifestPath
-  if not exists
-    then pure (Left ("manifest file not found: " <> T.pack manifestPath))
-    else do
+loadWorkspace mManifestPath mStoreOverride lenient = do
+  ePath <- resolveManifestPath mManifestPath
+  case ePath of
+    Left err -> pure (Left err)
+    Right manifestPath -> do
       bs <- BS.readFile manifestPath
       case decodeUtf8' bs of
         Left _ -> pure (Left ("manifest is not valid UTF-8: " <> T.pack manifestPath))
